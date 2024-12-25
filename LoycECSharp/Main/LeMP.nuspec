@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<package>
+  <metadata>
+    <id>LeMP</id>
+    <version>$version$</version>
+    <authors>David Piepgrass</authors>
+    <owners>David Piepgrass</owners>
+    <projectUrl>http://ecsharp.net/lemp/</projectUrl>
+    <!--<iconUrl>http://ICON_URL_HERE_OR_DELETE_THIS_LINE</iconUrl>-->
+    <readme>Readme.md</readme>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <summary>LeMP library (Lexical Macro Processor)</summary>
+    <description>LeMP is an open-source Lisp-inspired macro processor for C#. It helps you avoid writing boilerplate and repetitive code, and it provides a framework in which you can run code-generation algorithms at compile-time.
+    
+    This is the library version! The command-line tool package is called LeMP-Tool. Or, to integrate LeMP into Visual Studio, please download a release from https://github.com/qwertie/ecsharp/releases</description>
+    <releaseNotes>See http://ecsharp.net/lemp/version-history.html</releaseNotes>
+    <copyright>Copyright 2020</copyright>
+    <tags>Loyc Enhanced C# EC# ECSharp LeMP Lisp Macro Processor</tags>
+    <dependencies>
+      <group targetFramework=".NETFramework4.7.2">
+        <dependency id="Loyc.Interfaces" version="$version$"/>
+        <dependency id="Loyc.Essentials" version="$version$"/>
+        <dependency id="Loyc.Collections" version="$version$"/>
+        <dependency id="Loyc.Syntax" version="$version$"/>
+        <dependency id="Loyc.Utilities" version="$version$"/>
+        <dependency id="Loyc.Ecs" version="$version$"/>
+      </group>
+      <group targetFramework=".NETStandard2.0">
+        <dependency id="Loyc.Interfaces" version="$version$"/>
+        <dependency id="Loyc.Essentials" version="$version$"/>
+        <dependency id="Loyc.Collections" version="$version$"/>
+        <dependency id="Loyc.Syntax" version="$version$"/>
+        <dependency id="Loyc.Utilities" version="$version$"/>
+        <dependency id="Loyc.Ecs" version="$version$"/>
+      </group>
+    </dependencies>
+  </metadata>
+  <files>
+    <file src="..\Readme.md" />
+    <file src="..\Bin\Release\netcoreapp2.1\LeMP.*" target="lib\netstandard2.0\" />
+    <file src="..\Bin\Release\LeMP.*" target="lib\net472\" />
+    <file src="LeMP\**\*.cs" target="src\LeMP" />
+    <file src="LeMP\**\*.ecs" target="src\LeMP" />
+    <file src="LeMP.StdMacros\**\*.cs" target="src\LeMP.StdMacros" />
+    <file src="LeMP.StdMacros\**\*.ecs" target="src\LeMP.StdMacros" />
+  </files>
+</package>

@@ -1,0 +1,187 @@
+#importMacros (Loyc.LLPG);
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using Loyc;
+using Loyc.Collections;
+using Loyc.Syntax;
+using Loyc.Syntax.Lexing;
+
+namespace Loyc.LLParserGenerator
+{
+	using S = CodeSymbols;
+	using TT = TokenType;
+
+	internal class AntlrStyleParser : StageOneParser
+	{
+		[ThreadStatic]
+		static AntlrStyleParser _parser;
+
+		public new static LNodeList ParseTokenTree(TokenTree tokens, IMessageSink sink)
+		{
+			return Parse(tokens, tokens.File, sink);
+		}
+		public new static LNodeList Parse(IList<Token> tokenTree, ISourceFile file, IMessageSink messages)
+		{
+			if (_parser == null)
+				_parser = new AntlrStyleParser(tokenTree, file, messages);
+			else {
+				_parser.Reset(tokenTree, default(Token), file);
+				_parser.ErrorSink = messages;
+			}
+			return _parser.RulesAndStuff();
+		}
+
+		private AntlrStyleParser(IList<Token> tokens, ISourceFile file, IMessageSink messageSink) 
+			: base(tokens, file, messageSink) {}
+
+		LNode ParseHostReturnType(Token paren)
+		{
+			var list = ParseHostCode(paren, ParsingMode.FormalArguments);
+			if (list.Count != 1)
+				Error(-1, "LLLPG: Expected a single variable declaration (or data type) after '{0}'", ToString(paren.TypeInt));
+			LNode result;
+			if (list.Count > 0)
+				result = list[0];
+			else
+				result = LNode.Missing;
+			if (result.Calls(S.Var, 2)) {
+				if (!result[1].IsIdNamed("result"))
+					ErrorSink.Error(result[1], "LLLPG requires that the result of a rule be called 'result'");
+				return result[0];
+			} else
+				return result;
+		}
+
+		static readonly Symbol _init = (Symbol)"init";
+		static readonly Symbol _members = (Symbol)"members";
+		static readonly Symbol _token = (Symbol)"token";
+		static readonly Symbol _rule = (Symbol)"rule";
+		bool Is(int li, Symbol value)
+		{
+			var lt = LT(li);
+			return lt.Value == value;
+		}
+		
+		[FullLLk, AddCsLineDirectives(false)]
+		LLLPG (parser(laType: TT, matchType: int, allowSwitch: true,
+		              terminalType: Token, listInitializer: LNodeList _ = LNode.List()));
+
+		alias("(" = TT.LParen);
+		alias(")" = TT.RParen);
+		alias("[" = TT.LBrack);
+		alias("]" = TT.RBrack);
+		alias("{" = TT.LBrace);
+		alias("}" = TT.RBrace);
+		alias(":" = TT.Colon);
+		alias("::=" = TT.StartColon);
+		alias(";" = TT.Semicolon);
+		alias("@" = TT.At);
+
+		// The output is essentially #rule($returnType, $name, $args, $grammarExpr)
+		rule LNode Rule() @{
+			{
+				var attrs = LNode.List();
+				var args = LNode.List();
+				LNode retType = null;
+			}
+
+			// Attributes
+			[ "@"?           // LES expects @ before attributes
+			  "[" "]"        {attrs.AddRange(ParseHostCode($"[", ParsingMode.Expressions));} ]*
+			[ TT.AttrKeyword {attrs.Add(F.Id($(TT.AttrKeyword)));} ]*
+			
+			{bool isToken  = false;}
+			greedy
+			[	&{Is($LI,_token)} TT.Id {isToken = true;}
+			|	&{Is($LI,_rule)}  TT.Id
+			]?
+
+			ruleName:=TT.Id
+			[	"[" "]" { args = ParseHostCode($"[", ParsingMode.FormalArguments); }
+			|	"(" ")" { args = ParseHostCode($"(", ParsingMode.FormalArguments); }
+			]?
+			[	TT.Returns "[" "]" { retType = ParseHostReturnType($"["); }
+			|	TT.Returns "(" ")" { retType = ParseHostReturnType($"("); }
+			]?
+
+			{Token? initBrace = null;}
+			greedy
+			[	&{Is($LI,_init)} TT.Id initBrace="{" initRB:"}"	]?
+
+			// Ignore ANTLR stuff
+			[	id:=TT.Id 
+				{
+					string id2 = id.Value.ToString();
+					bool isAntlrThing = id2.IsOneOf("scope", "throws", "options", "after");
+					Error(-1, isAntlrThing
+						? "LLLPG does not support ANTLR rule directives ('scope', 'throws', 'options', etc.)."
+						: "Syntax error (expected ':' to begin the rule)");
+				}
+				["{" "}" | TT.Id]?
+			]?
+			
+			(	// ANTLR style
+				( ":"|"::=" | error {Error(0, "Expected ':' or '::=' to begin the rule");} greedy[TT.Assignment]? )
+				gExpr:GrammarExpr
+				";"
+			|	// also allow EC#/LES style, although support is incomplete as the return type must be "returns [...]"
+				"@" "{"
+				gExpr:GrammarExpr
+				"}" ";"?
+			)
+			{
+				if (initBrace != null) {
+					var initAction = ParseHostBraces(initBrace.Value, initRB.EndIndex, ParsingMode.Statements);
+					gExpr = quote(($initAction, $($gExpr)));
+				}
+				var rule = isToken ? F.Id("#token") : F.Id("#rule");
+				return quote(
+					// run_LLLPG preprocesses its children (in case any macros want to 
+					// help generate the grammar) but certain macros (e.g. the one for 
+					// tuples) interfere with the tree in $gExpr, so use `#noLexicalMacros`
+					// to block macro processing. After run_LLLPG performs codegen, it 
+					// allows macros to run on the result, so the `#noLexicalMacros` here
+					// doesn't block macros in grammar actions.
+					#noLexicalMacros(
+						[$(...attrs)]
+						$rule($(retType ?? F.Void), $(F.Id(ruleName)), #($(...args)), $($gExpr))
+					)
+				);
+			}
+		};
+
+		// Supports alias("..." = Token) statements
+		rule LNode HostCall() @{
+			[target:TT.Id]? "(" ")" ";"
+			{
+				var args = ParseHostCode($"(", ParsingMode.Expressions);
+				return F.Call(F.Id($target), args);
+			}
+		};
+		
+		// Inserts code into output. In ANTLR you write @members {...}
+		rule LNode HostBlock() @{
+			[&{Is($LI,_members)} TT.Id]?
+			"{" "}" ";"?
+			{
+				var args = ParseHostCode($"{", ParsingMode.Declarations);
+				return args.AsLNode(S.Splice);
+			}
+		};
+
+		[LL(4)]
+		public rule LNodeList RulesAndStuff() @{ // Start rule
+			( result+:Rule
+			| result+:HostCall
+			| result+:HostBlock
+			| error { Error(0, "Expected a rule definition here (or a block of code in the host language)"); }
+			)+
+			EOF
+		};
+
+		// Tell LLLPG about the base class rule Expr, which is used for rule bodies
+		extern rule LNode GrammarExpr() @{ nongreedy(_)+ };
+	}
+}

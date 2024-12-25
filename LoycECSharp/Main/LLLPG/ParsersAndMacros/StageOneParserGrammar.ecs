@@ -1,0 +1,162 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Text;
+using Loyc.Syntax;
+using Loyc.Utilities;
+using Loyc.Collections;
+using Loyc.Collections.Impl;
+using Loyc.Syntax.Lexing;
+
+namespace Loyc.LLParserGenerator
+{
+	using TT = TokenType;
+	using S = CodeSymbols;
+
+	internal partial class StageOneParser
+	{
+		[FullLLk] [Verbosity(3)]
+		LLLPG (parser(laType: TT, matchType: int, allowSwitch: true, terminalType: Token))
+		{
+			alias("("   = TT.LParen);
+			alias(")"   = TT.RParen);
+			alias("["   = TT.LBrack);
+			alias("]"   = TT.RBrack);
+			alias("{"   = TT.LBrace);
+			alias("}"   = TT.RBrace);
+			// Operators of LLLPG in order of precedence:
+			alias("."   = TT.Dot);
+			alias("-"   = TT.Minus);
+			alias("..." = TT.DotDotDot);
+			alias("~"   = TT.InvertSet);
+			alias("&"   = TT.And);
+			alias("&!"  = TT.AndNot);
+			alias(":="  = TT.Assignment);
+			alias(":"   = TT.Colon);
+			alias("+"   = TT.Plus);
+			alias("*"   = TT.Star);
+			alias("?"   = TT.QMark);
+			alias("!"   = TT.Bang);
+			alias(","   = TT.Comma);
+			alias("=>,<=>" = TT.Arrow);
+			alias("|"   = TT.Alt);
+			alias("/"   = TT.Slash);
+			
+			void Infix(ref LNode a, Token op, LNode b) => a = F.CallInfixOp(a, op, b);
+
+			public rule LNode Parse @{ e:=GrammarExpr EOF {return e;} };
+			
+			////////////////////////////////////////////////////////////////////
+
+			// Top-level rule body expression: a | b | ...
+			protected rule LNode GrammarExpr() @{
+				a:=SlashExpr
+				( op:="|" b:=SlashExpr {Infix(ref a, op, b);} )*
+				{return a;}
+			};
+			private rule LNode SlashExpr() @{
+				a:=GateExpr 
+				( op:="/" b:=GateExpr {Infix(ref a, op, b);} )*
+				{return a;}
+			};
+			private rule LNode GateExpr() @{
+				{Token? altType = null;}
+				(altType=(TT.Default|TT.Error))?
+				a:=SeqExpr
+				( op:="=>,<=>" b:=GateExpr {Infix(ref a, op, b);} )?
+				{
+					if (altType != null)
+						a = F.CallPrefixOp(altType.Value, a);
+					return a;
+				}
+			};
+			private rule LNode SeqExpr() @{
+				{var seq = LNode.List();}
+				(seq+=LoopExpr ","?)*
+				{
+					if (seq.Count == 1) return seq[0];
+					else if (seq.IsEmpty) return F.Tuple();
+					return F.Tuple(seq, seq[0].Range.StartIndex, seq.Last.Range.EndIndex);
+				}
+			};
+			private rule LNode LoopExpr() @{
+				{LNode a;}
+				(	modifier:=(TT.Greedy|TT.Nongreedy|TT.Recognizer|TT.NonRecognizer) a=AssignExpr 
+					{a = F.CallPrefixOp(modifier, a, null, NodeStyle.Default);}
+				|	a=AssignExpr
+				)
+				(	op:="*" {a = F.CallSuffixOp(a, _SufStar, op);}
+				|	op:="+" {a = F.CallSuffixOp(a, _SufPlus, op);}
+				|	op:="?" {a = F.CallSuffixOp(a, _SufOpt,  op);}
+				)?
+				{return a;}
+			};
+			
+			private rule LNode AssignExpr() @{
+				{Token op;}
+				a:=PrefixExpr
+				( op="!" {a = F.Call(_SufBang, a, a.Range.StartIndex, op.EndIndex);} )*
+				( op=(":="|":"|TT.HostOperator) b:=AssignExpr {Infix(ref a, op, b);} )?
+				{return a;}
+			};
+			
+			private rule LNode PrefixExpr() @
+			{	op:="~"       r:=PrefixExpr         {return F.CallPrefixOp(op, r, S.NotBits);}
+			|	op:="&"       r:=PrefixExprOrBraces {return F.CallPrefixOp(op, r, S.AndBits);}
+			|	op:=("&!")    r:=PrefixExprOrBraces {return F.CallPrefixOp(op, r, _AndNot);}
+			|	r:=RangeExpr  {return r;}
+			};
+			private rule LNode PrefixExprOrBraces() @
+			{	lb:="{" rb:="}" {return ParseHostBraces(lb, rb.EndIndex, ParsingMode.Expressions);}
+			/	e:=PrefixExpr   {return e;}
+			};
+			
+			private rule LNode RangeExpr() @{
+				a:=PrimaryExpr 
+				( op:="..." b:=PrimaryExpr {Infix(ref a, op, b);} )?
+				{return a;}
+			};
+			
+			private rule LNode PrimaryExpr() @
+				{	"-" e:=PrimaryExpr {return F.CallPrefixOp($"-", e, S._Negate);}
+				|	{LNode e, id;}
+					TT.Any TT.Id {id = F.Id($(TT.Id));}
+					( TT.In e=GateExpr
+					/ {e = id;})
+					{e = F.CallPrefixOp($(TT.Any), LNode.List(id, e));}
+					{return e;}
+				|	a:=Atom
+					greedy(
+						// dotted expr
+						op:="." b:=Atom {Infix(ref a, op, b);}
+					|	// rule call: no spaces between identifier and '('
+						&{a.Range.EndIndex == LT($LI).StartIndex}
+						(	lp:"(" rp:")"
+						|	lp:"[" rp:"]"
+						)
+						{a = F.CallPrefix(a, ParseHostCode(lp, ParsingMode.Expressions), rp);}
+					)*
+					{return a;}
+				};
+
+			private rule LNode Atom() @{
+				{LNode e;}
+				(	t:=(TT.Id|TT.In)
+					{e = F.Id(t);}
+				|	t:=TT.Literal
+					{e = F.Literal(t);}
+				|	lp:="(" rp:=")"     {e = ParseParens(lp, rp.EndIndex);}
+				|	lb:="{" rb:="}"     {e = ParseHostBraces(lb, rb.EndIndex, ParsingMode.Statements);}
+				|	lb:="[" rb:="]"
+					&("?"|"*")          {e = ParseParens(lb, rb.EndIndex);}
+				|	error {
+						e = F.Id(S.Missing, LT0.StartIndex, LT0.StartIndex);
+						Error(0, "LLLPG: Expected an identifier, literal, or expression in parenthesis");
+					}
+				)
+				{return e;}
+			};
+		}
+	}
+}

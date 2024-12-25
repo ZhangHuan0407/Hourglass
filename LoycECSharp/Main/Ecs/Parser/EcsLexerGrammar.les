@@ -1,0 +1,476 @@
+#importMacros LeMP.les2.to.ecs;
+#importMacros LeMP.ecs;
+#ecs;
+import System;
+import System.Collections.Generic;
+import System.Diagnostics;
+import System.Linq;
+import System.Text;
+import Loyc;
+import Loyc.Syntax;
+import Loyc.Syntax.Lexing;
+
+define change_temporarily($lhs = $rhs)
+{
+	var old_unique# = $lhs; // save old value in uniquely-named variable
+	$lhs = $rhs;
+	on_finally { $lhs = old_unique#; }
+};
+
+namespace Loyc.Ecs.Parser
+{
+	using TT = TokenType;
+	using S = EcsCodeSymbols;
+
+	@[#public, #partial] class EcsLexer
+	{
+		@[FullLLk, AddCsLineDirectives(true)]
+		LLLPG lexer();
+		
+		// Whitespace & comments -------------------------------------------------
+
+		@[extern] token Newline @{ '\r' '\n'? | '\n' }; // inherited from BaseLexer
+		@[#new] def Newline() {
+			base.Newline();
+			_allowPPAt = InputPosition;
+		};
+
+		@[private] token DotIndent @{
+			&{_startPosition == _lineStartAt}
+			{startPosition::int = InputPosition;}
+			('.' (' '|'\t')+)+
+			{
+				_indentLevel = MeasureIndent(_indent = CharSource.Slice(startPosition, InputPosition - startPosition));
+				//_value = WhitespaceTag.Value;
+			}
+		};
+		@[#new, private] token Spaces @{
+			{startPosition::int = InputPosition;}
+			(' '|'\t')+
+			{
+				if (_allowPPAt == startPosition) {
+					_allowPPAt = InputPosition;
+				};
+				if (_lineStartAt == startPosition) {
+					_indentLevel = MeasureIndent(_indent = CharSource.Slice(startPosition, InputPosition - startPosition));
+				};
+				//_value = WhitespaceTag.Value; we no longer produce space tokens
+			}
+		};
+		@[private] token UTF_BOM @{
+			'\uFEFF' // Byte order mark, in case the Encoding didn't strip it out.
+			{	if (_lineStartAt == _startPosition) { 
+					_lineStartAt = InputPosition;
+				};
+				_value = WhitespaceTag.Value;
+			}
+		};
+		@[private] token SLComment @{
+			"//" (~('\r'|'\n'))*
+			{_value = WhitespaceTag.Value;}
+		};
+		@[k(3), private]
+		token MLComment @{
+			"/*" nongreedy(&{AllowNestedComments} MLComment / Newline / _)* "*/"
+			{_value = WhitespaceTag.Value;}
+		};
+		
+		// Numbers ---------------------------------------------------------------
+
+		@[private] rule DecDigits() @{ '0'..'9'+ ('_' '0'..'9'+)* };
+		@[private] rule HexDigit()  @{ '0'..'9' | 'a'..'f' | 'A'..'F' };
+		@[private] rule HexDigits() @{ greedy(HexDigit)+ greedy('_' HexDigit+)* };
+		@[private] rule BinDigits() @{ '0'..'1'+ ('_' '0'..'1'+)* };
+		@[private] rule DecNumber() @{
+			( '.' DecDigits
+			| DecDigits     ( '.' DecDigits )?
+			)
+			( ('e'|'E') ('+'|'-')? DecDigits )?
+		};
+		@[private] rule HexNumber() @{
+			'0' ('x'|'X')
+			HexDigits?
+			// Avoid ambiguity with 0x5.Equals(): a dot is not enough
+			(	'.' &( '0'..'9' / HexDigits ('p'|'P') ('+'|'-'|'0'..'9') ) 
+				HexDigits )?
+			{ if InputPosition == _startPosition + 2 { Error(0, "Expected digits or '.'"); }; }
+			( ('p'|'P') ('+'|'-')? DecDigits )?
+		};
+		@[private] rule BinNumber() @{
+			'0' ('b'|'B')     
+			( '.' DecDigits   
+			| DecDigits     (  '.' DecDigits )?
+			)
+			( ('p'|'P') ('+'|'-')? DecDigits )?
+		};
+		@[private] token Number() @{
+			(HexNumber / BinNumber / DecNumber)
+			{ _textValue = Text(); }
+			{ _value = @@_; }
+			( ( ('f'|'F') { _value = @@_f; }
+			  | ('d'|'D') { _value = @@_d; }
+			  | ('m'|'M') { _value = @@_m; }
+			  )
+			| ('l'|'L') { _value = @@_L; } (('u'|'U') { _value = @@_uL;})?
+			| ('u'|'U') { _value = @@_u; } (('l'|'L') { _value = @@_uL;})?
+			| ('z'|'Z') { _value = @@_z; }
+			)?
+		};
+		
+		// Strings ---------------------------------------------------------------
+		
+		@[private] token SQString @{
+			{_parseNeeded = false;}
+			{_verbatim = false;}
+			( '\'' ['\\' _ {_parseNeeded = true;} | ~('\''|'\\'|'\r'|'\n')]* '\'' )
+			{ParseSQStringValue();}
+		};
+		@[private] token DQString @{
+			{_parseNeeded = false;}
+			{_verbatim = false;} 
+			(   '"' ['\\' _ {_parseNeeded = true;} | ~('"'|'\\'|'\r'|'\n')]* '"'
+			   | {_verbatim = true; _style = NodeStyle.VerbatimStringLiteral;}
+			     '@' '"' [ '"' '"' {_parseNeeded = true;} / ~'"' ]* '"' )
+			{_textValue = UnescapeQuotedString();}
+		};
+		@[k(4), private]
+		token TQString @{
+			{_parseNeeded = true;}
+			( '"' '"' '"' nongreedy(Newline / _)* '"' '"' '"' {_style = NodeStyle.TDQStringLiteral;}
+			| "'''"       nongreedy(Newline / _)* "'''"       {_style = NodeStyle.TQStringLiteral;}
+			)
+			{_textValue = UnescapeQuotedString();}
+		};
+		//@[private] rule BQStringV @{ {_verbatim=true;}
+		//	'`' ("``" {_parseNeeded = true;} | ~('`'|'\r'|'\n'))* '`'
+		//};
+		@[private] rule BQStringN @{ {_verbatim=false;}
+			'`' ('\\' {_parseNeeded = true;} _ | ~('`'|'\\'|'\r'|'\n'))* '`'
+		};
+		@[private] token BQString @{
+			{_parseNeeded = false;}
+			BQStringN
+			{_value = UnescapeQuotedString() -> Symbol;}
+		};
+
+		// Identifiers and Symbols -----------------------------------------------
+
+		@[private] rule IdStartChar @{ '_'|'a'..'z'|'A'..'Z'|'#' };
+		@[k(9), private]
+		token IdUniLetter @
+		{	&{char.IsLetter(LA0 -> char)} 0x80..0xFEFE
+		|	"\\u" HexDigit HexDigit HexDigit HexDigit { _parseNeeded = true; }
+		|	"\\U" HexDigit HexDigit HexDigit HexDigit HexDigit? HexDigit? { _parseNeeded = true; }
+		};
+		@[private]
+		token IdContChars @{ ('0'..'9'|IdStartChar|IdUniLetter|'\'' &!{LA($LI) == '\''})* };
+		
+		@[private] rule NormalId @{
+			(IdStartChar|IdUniLetter) IdContChars
+		};
+		
+		@[k(9), private]
+		token FancyId::bool @{ 
+			(	BQStringN                      {return true;} 
+			|	(IdUniLetter / LettersOrPunc)+ {return false;})
+		};
+		
+		@[private] token Symbol @{
+			{_parseNeeded = _verbatim = false;}
+			{isBQ::bool = false;}
+			'@' '@' (NormalId / isBQ=FancyId)
+			{_value = ParseSymbolValue(isBQ);}
+		};
+
+		@[k(2), private]
+		token Id @{
+			{_parseNeeded = _verbatim = false;}
+			{isBQ::bool = false;}
+			{skipTheAt::int = 0;}
+			(	'@' (NormalId / isBQ=FancyId) {skipTheAt=1; _style = NodeStyle.VerbatimId;} 
+			|	default NormalId )
+			{_value = ParseIdValue(skipTheAt, isBQ);}
+			{Debug.Assert(_value `'is` Symbol);}
+			// TQString is hopelessly ambiguous from LLLPG's perspective, as foo''' 
+			// appears to be a valid 6-character identifier, and makes LLLPG process 
+			// IdOrKeyword slowly. The gate (=>) fixes this issue.
+			(=>)
+			{ change_temporarily(_startPosition = InputPosition); }
+			(	TQString {_type = TT.Literal;}
+			/	DQString {_type = TT.Literal;}
+			)?
+		};
+		@[private] rule LettersOrPunc @{ '0'..'9'|'a'..'z'|'A'..'Z'|'_'|'#'|'\''
+			|'~'|'!'|'%'|'^'|'&'|'*'|'\\'|'-'|'+'|'='|'|'|'<'|'>'|'/'|'?'|':'|'.'|'$' };
+			
+		// Punctuation & operators -----------------------------------------------
+
+		@[private] token Comma     @{ ',' { _type = TT.Comma; _value = S.Comma; } };
+		@[private] token Semicolon @{ ';' { _type = TT.Semicolon; _value = S.Semicolon; } };
+		@[private] token At        @{ '@' { _type = TT.At;    _value = S.AtSign; } };
+
+		@[k(3), private] token Operator  @{
+		( "..." { _type = TT.DotDot; _value = S.DotDotDot; }
+		/ "..<" { _type = TT.DotDot; _value = S.DotDot; }
+		/ ".."  { _type = TT.DotDot; _value = S.DotDot; }
+		/ "."   { _type = TT.Dot; _value = S.Dot; }
+		| ">>=" { _type = TT.CompoundAssign; _value = S.ShrAssign; }
+		/ ">="  { _type = TT.LEGE; _value = S.GE; }
+		/ ">"   { _type = TT.GT; _value = S.GT; }
+		/ "<=>" { _type = TT.Compare; _value = S.Compare; }
+		/ "<<=" { _type = TT.CompoundAssign; _value = S.ShlAssign; }
+		/ "<="  { _type = TT.LEGE; _value = S.LE; }
+		/ "<"   { _type = TT.LT; _value = S.LT; }
+		| "&&"  { _type = TT.And; _value = S.And; }
+		/ "&="  { _type = TT.CompoundAssign; _value = S.AndBitsAssign; }
+		/ "&"   { _type = TT.AndBits; _value = S.AndBits; }
+		| "|>"  { _type = TT.PipeArrow; _value = S.ForwardPipeArrow; }
+		/ "|=>" { _type = TT.PipeArrow; _value = S.ForwardAssign; }
+		/ "||"  { _type = TT.OrXor; _value = S.Or; }
+		/ "|="  { _type = TT.CompoundAssign; _value = S.OrBitsAssign; }
+		/ "|"   { _type = TT.OrBits; _value = S.OrBits; }
+		| "^^"  { _type = TT.OrXor; _value = S.Xor; }
+		/ "^="  { _type = TT.CompoundAssign; _value = S.XorBitsAssign; }
+		/ "^"   { _type = TT.XorBits; _value = S.XorBits; }
+		| ":="  { _type = TT.CompoundAssign; _value = S.QuickBindAssign; }
+		/ "=:"  { _type = TT.QuickBind; _value = S.QuickBind; }
+		/ "::"  { _type = TT.ColonColon; _value = S.ColonColon; }
+		/ ":"   { _type = TT.Colon; _value = S.Colon; }
+		/ "==>" { _type = TT.Forward; _value = S.Forward; }
+		/ "=="  { _type = TT.EqNeq; _value = S.Eq; }
+		/ "=>"  { _type = TT.LambdaArrow; _value = S.Lambda; }
+		/ "="   { _type = TT.Assign; _value = S.Assign; }
+		| "!="  { _type = TT.EqNeq; _value = S.NotEq; }
+		/ "!"   { _type = TT.Not; _value = S.Not; }
+		| "~="  { _type = TT.CompoundAssign; _value = S.ConcatAssign; }
+		/ "~"   { _type = TT.NotBits; _value = S.NotBits; }
+		| "**=" { _type = TT.CompoundAssign; _value = S.ExpAssign; }
+		/ "**"  { _type = TT.Power; _value = S.Exp; }
+		/ "*="  { _type = TT.CompoundAssign; _value = S.MulAssign; }
+		/ "*"   { _type = TT.Mul; _value = S.Mul; }
+		| "/="  { _type = TT.CompoundAssign; _value = S.DivAssign; }
+		/ "/"   { _type = TT.DivMod; _value = S.Div; }
+		| "%="  { _type = TT.CompoundAssign; _value = S.ModAssign; }
+		/ "%"   { _type = TT.DivMod; _value = S.Mod; }
+		| "+="  { _type = TT.CompoundAssign; _value = S.AddAssign; }
+		/ "++"  { _type = TT.IncDec; _value = S.PreInc; }
+		/ "+"   { _type = TT.Add; _value = S.Add; }
+		| "->"  { _type = TT.PtrArrow; _value = S.RightArrow; } 
+		/ "-="  { _type = TT.CompoundAssign; _value = S.SubAssign; }
+		/ "--"  { _type = TT.IncDec; _value = S.PreDec; }
+		/ "-"   { _type = TT.Sub; _value = S.Sub; }
+		| "??=" { _type = TT.CompoundAssign; _value = S.NullCoalesceAssign; }
+		/ "??"  { _type = TT.NullCoalesce; _value = S.NullCoalesce; }
+		/ "?."  { _type = TT.NullDot; _value = S.NullDot; }
+		/ "?|>" { _type = TT.PipeArrow; _value = S.NullForwardPipeArrow; }
+		/ "?>"  { _type = TT.PipeArrow; _value = S.NullForwardPipeArrow; } // synonym for ?|>
+		/ "?|=>" { _type = TT.PipeArrow; _value = S.ForwardNullCoalesceAssign; }
+		/ "?=>" { _type = TT.PipeArrow; _value = S.ForwardNullCoalesceAssign; } // synonym for ?|=>
+		/ "?"   { _type = TT.QuestionMark; _value = S.QuestionMark; }
+		| "$"   { _type = TT.Substitute; _value = S.Substitute; }
+		| "\\"  { _type = TT.Backslash; _value = S.Backslash; }
+		)};
+
+		// Shebang ---------------------------------------------------------------
+
+		@[private] token Shebang @{
+			"#!" ~('\r'|'\n')* Newline?
+			{ _value = WhitespaceTag.Value; }
+		};
+
+		// Keywords --------------------------------------------------------------
+
+		prop AllowPP::bool { get { return _startPosition == _allowPPAt; } };
+
+		@[k(12), private]
+		token IdOrKeyword
+		@{ // Slug: the 2-second analysis in LLLPG appeared when &!{LA($LI) == '\''} was added in IdContChars
+		      "abstract"   (EndId=>{_type=TT.AttrKeyword; _value = S.Abstract;})
+			/ "as"         (EndId=>{_type=TT.As;          _value = S.As;})
+			/ "base"       (EndId=>{_type=TT.Base;        _value = S.Base;})
+			/ "bool"       (EndId=>{_type=TT.TypeKeyword; _value = S.Bool;})
+			/ "break"      (EndId=>{_type=TT.Break;       _value = S.Break;})
+			/ "byte"       (EndId=>{_type=TT.TypeKeyword; _value = S.UInt8;})
+			/ "case"       (EndId=>{_type=TT.Case;        _value = S.Case;})
+			/ "catch"      (EndId=>{_type=TT.Catch;       _value = S.Catch;})
+			/ "char"       (EndId=>{_type=TT.TypeKeyword; _value = S.Char;})
+			/ "checked"    (EndId=>{_type=TT.CheckedOrUnchecked; _value = S.Checked;})
+			/ "class"      (EndId=>{_type=TT.Class;       _value = S.Class;})
+			/ "const"      (EndId=>{_type=TT.AttrKeyword; _value = S.Const;})
+			/ "continue"   (EndId=>{_type=TT.Continue;    _value = S.Continue;})
+			/ "decimal"    (EndId=>{_type=TT.TypeKeyword; _value = S.Decimal;})
+			/ "default"    (EndId=>{_type=TT.Default;     _value = S.Default;})
+			/ "delegate"   (EndId=>{_type=TT.Delegate;    _value = S.Delegate;})
+			/ "double"     (EndId=>{_type=TT.TypeKeyword; _value = S.Double;})
+			/ "do"         (EndId=>{_type=TT.Do;          _value = S.Do;})
+			/ "else"       (EndId=>{_type=TT.Else;        _value = S.Else;})
+			/ "enum"       (EndId=>{_type=TT.Enum;        _value = S.Enum;})
+			/ "event"      (EndId=>{_type=TT.Event;       _value = S.Event;})
+			/ "explicit"   (EndId=>{_type=TT.AttrKeyword; _value = S.Explicit;})
+			/ "extern"     (EndId=>{_type=TT.AttrKeyword; _value = S.Extern;})
+			/ "false"      (EndId=>{_type=TT.Literal;     _value = G.BoxedFalse;})
+			/ "finally"    (EndId=>{_type=TT.Finally;     _value = S.Finally;})
+			/ "fixed"      (EndId=>{_type=TT.Fixed;       _value = S.Fixed;})
+			/ "float"      (EndId=>{_type=TT.TypeKeyword; _value = S.Single;})
+			/ "foreach"    (EndId=>{_type=TT.Foreach;     _value = S.ForEach;})
+			/ "for"        (EndId=>{_type=TT.For;         _value = S.For;})
+			/ "goto"       (EndId=>{_type=TT.Goto;        _value = S.Goto;})
+			/ "if"         (EndId=>{_type=TT.If;          _value = S.If;})
+			/ "implicit"   (EndId=>{_type=TT.AttrKeyword; _value = S.Implicit;})
+			/ "interface"  (EndId=>{_type=TT.Interface;   _value = S.Interface;})
+			/ "internal"   (EndId=>{_type=TT.AttrKeyword; _value = S.Internal;})
+			/ "int"        (EndId=>{_type=TT.TypeKeyword; _value = S.Int32;})
+			/ "in"         (EndId=>{_type=TT.In;          _value = S.In;})
+			/ "is"         (EndId=>{_type=TT.Is;          _value = S.Is;})
+			/ "lock"       (EndId=>{_type=TT.Lock;        _value = S.Lock;})
+			/ "long"       (EndId=>{_type=TT.TypeKeyword; _value = S.Int64;})
+			/ "namespace"  (EndId=>{_type=TT.Namespace;   _value = S.Namespace;})
+			/ "new"        (EndId=>{_type=TT.New;         _value = S.New;})
+			/ "null"       (EndId=>{_type=TT.Literal;     _value = null;})
+			/ "object"     (EndId=>{_type=TT.TypeKeyword; _value = S.Object;})
+			/ "operator"   (EndId=>{_type=TT.Operator;    _value = S.Operator;})
+			/ "out"        (EndId=>{_type=TT.AttrKeyword; _value = S.Out;})
+			/ "override"   (EndId=>{_type=TT.AttrKeyword; _value = S.Override;})
+			/ "params"     (EndId=>{_type=TT.AttrKeyword; _value = S.Params;})
+			/ "private"    (EndId=>{_type=TT.AttrKeyword; _value = S.Private;})
+			/ "protected"  (EndId=>{_type=TT.AttrKeyword; _value = S.Protected;})
+			/ "public"     (EndId=>{_type=TT.AttrKeyword; _value = S.Public;})
+			/ "readonly"   (EndId=>{_type=TT.AttrKeyword; _value = S.Readonly;})
+			/ "ref"        (EndId=>{_type=TT.AttrKeyword; _value = S.Ref;})
+			/ "return"     (EndId=>{_type=TT.Return;      _value = S.Return;})
+			/ "sbyte"      (EndId=>{_type=TT.TypeKeyword; _value = S.Int8;})
+			/ "sealed"     (EndId=>{_type=TT.AttrKeyword; _value = S.Sealed;})
+			/ "short"      (EndId=>{_type=TT.TypeKeyword; _value = S.Int16;})
+			/ "sizeof"     (EndId=>{_type=TT.Sizeof;      _value = S.Sizeof;})
+			/ "stackalloc" (EndId=>{_type=TT.Stackalloc;  _value = S.StackAlloc;})
+			/ "static"     (EndId=>{_type=TT.AttrKeyword; _value = S.Static;})
+			/ "string"     (EndId=>{_type=TT.TypeKeyword; _value = S.String;})
+			/ "struct"     (EndId=>{_type=TT.Struct;      _value = S.Struct;})
+			/ "switch"     (EndId=>{_type=TT.Switch;      _value = S.SwitchStmt;})
+			/ "this"       (EndId=>{_type=TT.This;        _value = S.This;})
+			/ "throw"      (EndId=>{_type=TT.Throw;       _value = S.Throw;})
+			/ "true"       (EndId=>{_type=TT.Literal;     _value = G.BoxedTrue;})
+			/ "try"        (EndId=>{_type=TT.Try;         _value = S.Try;})
+			/ "typeof"     (EndId=>{_type=TT.Typeof;      _value = S.Typeof;})
+			/ "uint"       (EndId=>{_type=TT.TypeKeyword; _value = S.UInt32;})
+			/ "ulong"      (EndId=>{_type=TT.TypeKeyword; _value = S.UInt64;})
+			/ "unchecked"  (EndId=>{_type=TT.CheckedOrUnchecked; _value = S.Unchecked;})
+			/ "unsafe"     (EndId=>{_type=TT.AttrKeyword; _value = S.Unsafe;})
+			/ "ushort"     (EndId=>{_type=TT.TypeKeyword; _value = S.UInt16;})
+			/ "using"      (EndId=>{_type=TT.Using;       _value = S.UsingStmt;})
+			/ "virtual"    (EndId=>{_type=TT.AttrKeyword; _value = S.Virtual;})
+			/ "volatile"   (EndId=>{_type=TT.AttrKeyword; _value = S.Volatile;})
+			/ "void"       (EndId=>{_type=TT.TypeKeyword; _value = S.Void;})
+			/ "while"      (EndId=>{_type=TT.While;       _value = S.While;})
+			/ &{AllowPP} "#if"        (EndId=>{_type=TT.PPif;        _value = S.PPIf;})
+			/ &{AllowPP} "#else"      (EndId=>{_type=TT.PPelse;      _value = S.PPElse;})
+			/ &{AllowPP} "#elif"      (EndId=>{_type=TT.PPelif;      _value = S.PPElIf;})
+			/ &{AllowPP} "#endif"     (EndId=>{_type=TT.PPendif;     _value = S.PPEndIf;})
+			/ &{AllowPP} "#define"    (EndId=>{_type=TT.PPdefine;    _value = S.PPDefine;})
+			/ &{AllowPP} "#undef"     (EndId=>{_type=TT.PPundef;     _value = S.PPUndef;})
+			/ &{AllowPP} "#pragma"    (EndId=>{_type=TT.PPpragma;    _value = S.PPPragma;})
+			/ &{AllowPP} "#line"      (EndId=>{_type=TT.PPline;      _value = S.PPLine;})
+			/ &{AllowPP} "#error"     (EndId=>{_type=TT.PPerror;    } _value=RestOfPPLine)
+			/ &{AllowPP} "#warning"   (EndId=>{_type=TT.PPwarning;  } _value=RestOfPPLine)
+			/ &{AllowPP} "#note"      (EndId=>{_type=TT.PPnote;     } _value=RestOfPPLine)
+			/ &{AllowPP} "#region"    (EndId=>{_type=TT.PPregion;   } _value=RestOfPPLine)
+			/ &{AllowPP} "#endregion" (EndId=>{_type=TT.PPendregion;} _value=RestOfPPLine)
+			/ &{AllowPP} "#nullable"  (EndId=>{_type=TT.PPnullable;}  _value=RestOfPPLine)
+			/ &{AllowPP} "#r"         (EndId=>{_type=TT.CSIreference;} _value=RestOfPPLine)
+			/ &{AllowPP} "#load"      (EndId=>{_type=TT.CSIload;}     _value=RestOfPPLine)
+			/ &{AllowPP} "#cls"       (EndId=>{_type=TT.CSIclear;     _value = S.CsiCls;})
+			/ &{AllowPP} "#clear"     (EndId=>{_type=TT.CSIclear;     _value = S.CsiClear;})
+			/ &{AllowPP} "#help"      (EndId=>{_type=TT.CSIhelp;      _value = S.CsiHelp;})
+			/ &{AllowPP} "#reset"     (EndId=>{_type=TT.CSIreset;     _value = S.CsiReset;})
+			/ "var"                   (EndId=>{_type=TT.ContextualKeyword; _value = _var;})
+			/ "dynamic"               (EndId=>{_type=TT.ContextualKeyword; _value = _dynamic;})
+			/ "trait"                 (EndId=>{_type=TT.ContextualKeyword; _value = _trait;})
+			/ "alias"                 (EndId=>{_type=TT.ContextualKeyword; _value = _alias;})
+			/ "assembly"              (EndId=>{_type=TT.ContextualKeyword; _value = _assembly;})
+			/ "module"                (EndId=>{_type=TT.ContextualKeyword; _value = _module;})
+			/ "from"                  (EndId=>{_type=TT.LinqKeyword;       _value = _from;})
+			/ "where"                 (EndId=>{_type=TT.ContextualKeyword; _value = _where;})
+			/ "when"                  (EndId=>{_type=TT.ContextualKeyword; _value = _when;})
+			/ "with"                  (EndId=>{_type=TT.ContextualKeyword; _value = _with;})
+			/ "select"                (EndId=>{_type=TT.LinqKeyword;       _value = _select;})
+			/ "join"                  (EndId=>{_type=TT.LinqKeyword;       _value = _join;})
+			/ "on"                    (EndId=>{_type=TT.LinqKeyword;       _value = _on;})
+			/ "equals"                (EndId=>{_type=TT.LinqKeyword;       _value = _equals;})
+			/ "into"                  (EndId=>{_type=TT.LinqKeyword;       _value = _into;})
+			/ "let"                   (EndId=>{_type=TT.LinqKeyword;       _value = _let;})
+			/ "orderby"               (EndId=>{_type=TT.LinqKeyword;       _value = _orderby;})
+			/ "ascending"             (EndId=>{_type=TT.LinqKeyword;       _value = _ascending;})
+			/ "descending"            (EndId=>{_type=TT.LinqKeyword;       _value = _descending;})
+			/ "group"                 (EndId=>{_type=TT.LinqKeyword;       _value = _group;})
+			/ "by"                    (EndId=>{_type=TT.LinqKeyword;       _value = _by;})
+			/ "await"                 (EndId=>{_type=TT.ContextualKeyword; _value = _await;})
+			/ Id
+		};
+
+		@[static, readonly] _var::Symbol = GSymbol.Get("var");
+		@[static, readonly] _dynamic::Symbol = GSymbol.Get("dynamic");
+		@[static, readonly] _trait::Symbol = GSymbol.Get("trait");
+		@[static, readonly] _alias::Symbol = GSymbol.Get("alias");
+		@[static, readonly] _assembly::Symbol = GSymbol.Get("assembly");
+		@[static, readonly] _module::Symbol = GSymbol.Get("module");
+		@[static, readonly] _await::Symbol = GSymbol.Get("await");
+		
+		@[static, readonly] _where::Symbol = GSymbol.Get("where");
+		@[static, readonly] _when::Symbol = GSymbol.Get("when");
+		@[static, readonly] _with::Symbol = GSymbol.Get("with");
+		@[static, readonly] _select::Symbol = GSymbol.Get("select");
+		@[static, readonly] _from::Symbol = GSymbol.Get("from");
+		@[static, readonly] _join::Symbol = GSymbol.Get("join");
+		@[static, readonly] _on::Symbol = GSymbol.Get("on");
+		@[static, readonly] _equals::Symbol = GSymbol.Get("equals");
+		@[static, readonly] _into::Symbol = GSymbol.Get("into");
+		@[static, readonly] _let::Symbol = GSymbol.Get("let");
+		@[static, readonly] _orderby::Symbol = GSymbol.Get("orderby");
+		@[static, readonly] _ascending::Symbol = GSymbol.Get("ascending");
+		@[static, readonly] _descending::Symbol = GSymbol.Get("descending");
+		@[static, readonly] _group::Symbol = GSymbol.Get("group");
+		@[static, readonly] _by::Symbol = GSymbol.Get("by");
+
+		rule RestOfPPLine::string @{ // Consume rest of line after preprocessor directive
+			{start::int = InputPosition;}
+			~('\r'|'\n')*
+			{return CharSource.Slice(start, InputPosition-start).ToString();}
+		};
+		
+		// This is a "fake" rule used by IdOrKeyword for prediction (rule body is not generated)
+		@[#extern] token EndId @{
+			~('a'..'z'|'A'..'Z'|'0'..'9'|'_'|'#') | EOF
+		};
+
+		// Token -----------------------------------------------------------------
+
+		@[k(3), private]
+		token Token @{
+			( {_type = TT.Newline;}    Newline   { _value = WhitespaceTag.Value; }
+			/ {_type = TT.Literal;}    Number    // length-ambiguous with Operator .
+			/ {_type = TT.SLComment;}  SLComment // length-ambiguous with Operator /
+			/ {_type = TT.MLComment;}  MLComment // length-ambiguous with Operator /
+			/ &{InputPosition == 0} 
+			  {_type = TT.Shebang;}    Shebang   // ambiguous with Id at start of file
+			/ {_type = TT.Id;}  (Id => IdOrKeyword)
+			/ {_type = TT.Literal;}    TQString  // length-ambiguous with DQString "", SQString ''
+			/ {_type = TT.Literal;}    SQString
+			/ {_type = TT.Literal;}    DQString
+			/ {_type = TT.BQString;}   BQString
+			/ {_type = TT.Literal;}    Symbol    // length-ambiguous with At @
+			/ {_type = TT.At;}         At
+			/                          Operator
+			/ {_type = TT.Spaces;}     UTF_BOM
+			| {_type = TT.Comma;}      Comma
+			| {_type = TT.Semicolon;}  Semicolon
+			| {_type = TT.LParen;}     '('
+			| {_type = TT.RParen;}     ')'
+			| {_type = TT.LBrack;}     '['
+			| {_type = TT.RBrack;}     ']'
+			| {_type = TT.LBrace;}     '{'
+			| {_type = TT.RBrace;}     '}'
+			| error { _type = TT.Unknown; Error(0, "Unrecognized token"); } _
+			)
+		};
+	};
+};

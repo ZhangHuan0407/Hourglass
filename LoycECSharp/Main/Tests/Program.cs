@@ -1,0 +1,76 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using LeMP;
+using LeMP.Tests;
+using Loyc;
+using Loyc.Collections;
+using Loyc.Ecs.Tests;
+using Loyc.MiniTest;
+
+namespace Loyc.Tests
+{
+	public class RunMainTests
+	{
+		public static readonly VList<Pair<string, Func<int>>> Menu = RunCoreTests.Menu.AddRange(
+			new Pair<string, Func<int>>[] {
+				new Pair<string,Func<int>>("Run unit tests of Enhanced C#", Test_Ecs),
+				new Pair<string,Func<int>>("Run unit tests of LeMP", Test_LeMP),
+				new Pair<string,Func<int>>("Run unit tests of LLLPG", Loyc.LLParserGenerator.Program.Test_LLLPG),
+				new Pair<string,Func<int>>("LeMP article examples", Samples.Samples.Run),
+			});
+
+		public static void Main(string[] args)
+		{
+			#if DotNet3 || DotNet4
+			// Workaround for MS bug: Assert(false) will not fire in debugger
+			Debug.Listeners.Clear();
+			Debug.Listeners.Add( new DefaultTraceListener() );
+			#endif
+			if (RunCoreTests.RunMenu(Menu, args.Length > 0 ? args[0].GetEnumerator() : null) > 0)
+				// Let the outside world know that something
+				// went wrong by setting the exit code to
+				// '1'. This is particularly useful for
+				// automated tests (CI).
+				Environment.ExitCode = 1;
+		}
+
+		public static int Test_Ecs()
+		{
+			return RunTests.RunMany(
+				new EcsLexerTests(),
+				new EcsParserTests(),
+				new EcsNodePrinterTests(),
+				new EcsValidatorTests());
+		}
+		public static int Test_LeMP()
+		{
+			return RunTests.RunMany(
+				new MacroProcessorTests(),
+				new PreludeMacroTests_Les2(),
+				new PreludeMacroTests_Les3(),
+				new CompilerTests(),
+				new SmallerMacroTests(),
+				new LiteralTests(),
+				new TestAlgebraicDataTypes(),
+				new TestCodeContractMacros(),
+				new TestCodeQuoteMacro(),
+				new TestMacroCombinations(),
+				new TestMatchCodeMacro(),
+				new TestStaticMatchCodeMacro(),
+				new TestStaticDeconstructMacro(),
+				new TestMatchMacro(),
+				new TestOnFinallyReturnThrowMacros(),
+				new TestReplaceAndDefineMacros(),
+				new TestUseSequenceExpressionsMacro(),
+				new TestSetOrCreateMemberMacro(),
+				new TestUnrollMacro(),
+				new TestUseSymbolsMacro(),
+				new TestCompileTimeMacros(),
+				new TestUserDefinedMacroMacro());
+		}
+	}
+}
