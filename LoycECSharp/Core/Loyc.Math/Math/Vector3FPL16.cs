@@ -140,5 +140,20 @@ namespace Loyc.Math
 		public static FPL16 Dot(Vector3FPL16 lhs, Vector3FPL16 rhs) => lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z;
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
 		public static Vector3FPL16 Cross(Vector3FPL16 lhs, Vector3FPL16 rhs) => new Vector3FPL16(lhs.y * rhs.z - lhs.z * rhs.y, lhs.z * rhs.x - lhs.x * rhs.z, lhs.x * rhs.y - lhs.y * rhs.x);
+
+
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		public static Vector3FPL16 Lerp(Vector3FPL16 a, Vector3FPL16 b, FPL16 t)
+		{
+			t = MathFPL16.Value.Clamp01(t);
+			return new Vector3FPL16(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
+		}
+
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		public static Vector3FPL16 LerpUnclamped(Vector3FPL16 a, Vector3FPL16 b, FPL16 t)
+		{
+			return new Vector3FPL16(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
+		}
+
 	}
 }

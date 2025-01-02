@@ -148,7 +148,20 @@ namespace Loyc.Math
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static FPL16 Dot(Vector2FPL16 lhs, Vector2FPL16 rhs) => lhs.x * rhs.x + lhs.y * rhs.y;
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		public static Vector2FPL16 Lerp(Vector2FPL16 a, Vector2FPL16 b, FPL16 t)
+		{
+			t = MathFPL16.Value.Clamp01(t);
+			return new Vector2FPL16(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+		}
+
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		public static Vector2FPL16 LerpUnclamped(Vector2FPL16 a, Vector2FPL16 b, FPL16 t)
+		{
+			return new Vector2FPL16(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+		}
+		
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
         public override string ToString() => $"({x}, {y})";
     }
 }
