@@ -2,3 +2,15 @@ Hourglass/*
 
 *.csproj
 UnityProject/UnityProject.sln
+
+LoycECSharp/packages/
+LoycECSharp/.vs
+LoycECSharp/Core/.vs
+LoycECSharp/Core/Bin
+LoycECSharp/Bin
+LoycECSharp/Main/Ecs/obj
+LoycECSharp/Main/Tests/obj
+LoycECSharp/Main/LLLPG/obj
+LoycECSharp/Main/LeMP/obj
+LoycECSharp/Main/LeMP.StdMacros/obj
+LoycECSharp/Main/LeMPDemo/obj
