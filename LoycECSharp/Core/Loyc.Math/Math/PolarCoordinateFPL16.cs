@@ -43,7 +43,7 @@ namespace Loyc.Math
 
 		public static PolarCoordinateFPL16 FromCenterToPoint(Vector2FPL16 centerPosition, Vector2FPL16 position)
 		{
-			Vector2FPL16 delta = centerPosition - position;
+			Vector2FPL16 delta = position - centerPosition;
 			FPL16 length = delta.Magnitude;
 			if (length.N < FPL16TriangleFunctionExtension.Interval_Prescaled)
 				return PolarCoordinateFPL16.Zero;
